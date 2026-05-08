@@ -34,6 +34,10 @@ export default async function runWorker (pipe) {
     })
     mnemonic = mnemonic || Identity.generateMnemonic()
   }
+  // Pear.app.storage is not guaranteed to exist on disk yet: Corestore creates
+  // it as a side effect, but that runs later in WorkerTask._open(). On a fresh
+  // --store path the writeFile below would otherwise ENOENT.
+  await fs.promises.mkdir(Pear.app.storage, { recursive: true })
   await fs.promises.writeFile(mnemonicPath, mnemonic)
 
   const workerTask = new WorkerTask(rpc, storage, mnemonic, cmd.flags)

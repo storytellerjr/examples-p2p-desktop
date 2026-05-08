@@ -323,3 +323,55 @@ Each example gets its own namespace on disk. You can hop between folders without
 The `pear run --store ...` path is **not** just a working directory — it's the corestore root, and the schema that wrote those blocks travels with the bytes. Treat one store as bound to one app/schema.
 
 ---
+
+## Q: After switching to a fresh `--store /tmp/identity-user1`, I now get `ENOENT: no such file or directory, open "/tmp/identity-user1/identity-mnemonic.txt"`. Why?
+
+### What the error means
+
+```
+Uncaught FileError: ENOENT: no such file or directory,
+  open "/tmp/identity-user1/identity-mnemonic.txt"
+    at async runWorker (pear://dev/worker/index.js:37:3)
+```
+
+The crash is on the `fs.promises.writeFile(mnemonicPath, mnemonic)` call in `worker/index.js`. ENOENT on a `writeFile` doesn't mean the *file* is missing (writeFile creates files) — it means the *parent directory* is missing. So `/tmp/identity-user1/` itself doesn't exist yet.
+
+### Why the upstream example works on `/tmp/user1` but not on a fresh path
+
+Look at the order of operations in `worker/index.js`:
+
+```js
+const storage = path.join(Pear.app.storage, 'corestore')   // 1. compute paths
+…
+await fs.promises.readFile(mnemonicPath, …)                // 2. try to read mnemonic
+await fs.promises.writeFile(mnemonicPath, mnemonic)        // 3. write mnemonic ← crashes here
+…
+await workerTask.ready()                                   // 4. Corestore opens; *now* it
+                                                           //    creates Pear.app.storage
+```
+
+The mnemonic file is written **before** anything has touched `Pear.app.storage` on disk. Corestore is what would normally create that directory, but it doesn't run until `workerTask.ready()` later. So on a brand-new store path, the parent dir doesn't exist when `writeFile` runs.
+
+We didn't hit this on `/tmp/user1` earlier because that directory was already on disk — left over from previous runs of `basic-chat` / `basic-chat-blind-peering`. Folder-scoped paths like `/tmp/identity-user1` start clean, so the latent bug surfaces.
+
+This is a real bug in the upstream pearopen example, not something we introduced by changing the path.
+
+### The fix (applied in `worker/index.js:37-40`)
+
+One line of `mkdir -p` semantics before the write, plus a comment explaining why it's needed:
+
+```js
+// Pear.app.storage is not guaranteed to exist on disk yet: Corestore creates
+// it as a side effect, but that runs later in WorkerTask._open(). On a fresh
+// --store path the writeFile below would otherwise ENOENT.
+await fs.promises.mkdir(Pear.app.storage, { recursive: true })
+await fs.promises.writeFile(mnemonicPath, mnemonic)
+```
+
+### Lesson worth keeping
+
+- `Pear.app.storage` is a **logical path** — Pear sets the value, but it doesn't materialise the directory on disk until something (typically Corestore) writes into it.
+- Any code that touches `Pear.app.storage` directly *before* Corestore opens (mnemonic files, config, logs, any persistent metadata) needs to either `mkdir` first or be moved to run after `WorkerTask.ready()`.
+- The general pattern: side-effects in initialization order matter. "It worked on the first try" can mean "the side-effect from a previous run papered over a missing call." Folder-scoped, clean store paths are also useful for *finding* these latent bugs.
+
+---
