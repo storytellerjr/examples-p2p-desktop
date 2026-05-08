@@ -1,3 +1,11 @@
 node_modules
 build
 output.css
+
+# Local Claude Code settings (machine-specific, never push)
+.claude/
+
+# Identity material — must never enter the repo even if someone
+# changes --store to point inside the working tree
+*-mnemonic.txt
+identity-mnemonic.*
