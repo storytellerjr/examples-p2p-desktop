@@ -19,6 +19,15 @@ pear run --store /tmp/identity-user1 . --name user1
 pear run --store /tmp/identity-user2 . --name user2 --invite <invite>
 ```
 
+## Reading the message list
+
+Each message in the UI is prefixed with `[✔]` or `[✘]`. This is **not** a "valid vs forged" indicator. In `worker/worker-task.js` every message's proof is verified against the **local user's own** identity public key, so:
+
+- `[✔]` on a message you sent — your proof verifies against your identity, so the sign/verify pipeline is intact.
+- `[✘]` on a message someone else sent — their proof was produced by *their* identity, not yours. It is not a forgery; you are just verifying it against the wrong key.
+
+This is a deliberately narrow smoke test of identity signing. A real app would verify each message against the *claimed sender's* identity (pinned, or looked up via a writer-key → identity map). See `notes.md` for the full breakdown.
+
 ## Build Pear app
 ```shell
 npm i

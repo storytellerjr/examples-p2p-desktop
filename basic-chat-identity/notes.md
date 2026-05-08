@@ -375,3 +375,122 @@ await fs.promises.writeFile(mnemonicPath, mnemonic)
 - The general pattern: side-effects in initialization order matter. "It worked on the first try" can mean "the side-effect from a previous run papered over a missing call." Folder-scoped, clean store paths are also useful for *finding* these latent bugs.
 
 ---
+
+## Q: In the UI I see a `[✔]` in front of my own messages and a `[✘]` in front of the other user's messages. What does that mean?
+
+### Where the marks come from
+
+`ui/root.jsx:32` renders the line with a leading `[✔]` or `[✘]` based on `msg.info.verified`:
+
+```jsx
+<li …>{`[${msg.info.verified ? '✔' : '✘'}] ${msg.text} ~ ${msg.info.name} ~ …`}</li>
+```
+
+The `verified` flag is set in the worker, in `worker-task.js:58-63`:
+
+```js
+for (const msg of messages) {
+  const res = Identity.verify(msg.proof, Buffer.from(msg.text), {
+    expectedIdentity: this.identity.identityPublicKey   // ← LOCAL user's identity key
+  })
+  msg.info.verified = !!res
+}
+```
+
+### What ✔ vs ✘ actually means here
+
+`Identity.verify(proof, text, { expectedIdentity })` returns a truthy value only when the proof was produced by the holder of the identity whose public key matches `expectedIdentity`. The example passes `this.identity.identityPublicKey` — i.e. **the identity of whoever is currently running the app**.
+
+So in concrete terms, with two users running:
+
+- **`[✔]` on your own messages.** You signed them with your device key + your device proof. The proof verifies against your identity public key. ✓
+- **`[✘]` on the other user's messages.** Their proof was made by *their* identity, which is a different public key from yours. Verifying their proof against *your* `expectedIdentity` is bound to fail — not because their proof is invalid, but because you're asking the wrong question ("did *I* sign this?" — no, *they* did).
+
+It is **not** "✘ means tampered / fake." Their messages are perfectly well-signed; you're just verifying them against the wrong identity.
+
+### Why the example is written this way
+
+It's a smoke test of the signing/verification pipeline, demonstrable with a single keypair and no extra wiring:
+
+- "Did `attestData` produce a `proof` that `verify` accepts when called with the same identity?" — yes if ✔, broken if ✘.
+- It deliberately stays *out* of the harder problem of "who is the other person, and how do I know their identity public key?" That's an out-of-band trust question (pin it, scan a QR, look it up on a website, derive it from an enrollment cred, etc.).
+
+### What a real app would do instead
+
+For a real chat / education / docs app, you want one of these per record type:
+
+- **Pinned identity** — for content where the sender is known up front (e.g., course material from the instructor): `expectedIdentity: INSTRUCTOR_IDENTITY_PUBKEY` baked in at app build or fetched once and pinned.
+- **Per-sender lookup** — for user-to-user messages: maintain a map *autobase writer key → claimed identity public key* (recorded when each writer was added) and verify each message against the claimed sender's identity. The current `add-writer` dispatch (`chat-room-identity.js:111-113`) only stores the writer key — you'd extend the schema/dispatch to also persist the identity key the writer is announcing.
+- **No `expectedIdentity` at all** — let `Identity.verify` *return* the recovered identity (when the binding is "trust whoever signed it" rather than "this specific identity"). Useful for capability-style flows.
+
+Until one of those is wired in, the example's `[✔]` simply means "the local user signed this, and the signing pipeline is intact" — which, on its own, is still a useful diagnostic: if you ever see `[✘]` on a message *you* sent, something is broken in your local signing chain.
+
+---
+
+## Q: Where is the user's mnemonic seed phrase stored, and how can I see it? It's not in the UI.
+
+### Where on disk
+
+Right next to the corestore, in **`<Pear.app.storage>/identity-mnemonic.txt`**, written by `worker/index.js:30-41`:
+
+```js
+const mnemonicPath = path.join(Pear.app.storage, 'identity-mnemonic.txt')
+if (!mnemonic) {
+  mnemonic = await fs.promises.readFile(mnemonicPath, 'utf-8').catch(…)
+  mnemonic = mnemonic || Identity.generateMnemonic()
+}
+await fs.promises.mkdir(Pear.app.storage, { recursive: true })
+await fs.promises.writeFile(mnemonicPath, mnemonic)
+```
+
+`Pear.app.storage` is whatever you passed to `--store`, so with the README's commands the actual files are:
+
+- user1 → `/tmp/identity-user1/identity-mnemonic.txt`
+- user2 → `/tmp/identity-user2/identity-mnemonic.txt`
+
+It's a plain UTF-8 text file containing the 24 words separated by spaces. Nothing else.
+
+### Three ways to see it
+
+**1. Look at the terminal output on launch.** `worker/index.js:46` prints it on every run:
+```
+Storage: /tmp/identity-user1/corestore
+Name: user1
+Mnemonic (24 words): apple banana cherry … (24 words)
+Invite: <invite-string>
+```
+That's why the README says to start user1 first — same console line that gives you the invite also gives you the mnemonic.
+
+**2. Read the file directly.**
+```sh
+cat /tmp/identity-user1/identity-mnemonic.txt
+```
+Same 24 words, no formatting tricks.
+
+**3. Pass it explicitly via the `--mnemonic` CLI flag** (defined at `worker/index.js:14`):
+```sh
+pear run --store /tmp/identity-user1-restore . --name user1 --mnemonic "apple banana cherry …"
+```
+This is the "restore from seed" path — useful for reproducing the identity on a new device or fresh `--store` directory. If `--mnemonic` is supplied, it skips the read-from-disk step and uses what you gave; the resulting `identity-mnemonic.txt` in the new store will hold that same phrase.
+
+### Why it's not in the UI (and shouldn't be, in a real app)
+
+A mnemonic is the master secret — anyone who has it can impersonate that identity on any device, forever (until you stop trusting that identity). The example deliberately keeps it out of the React UI because:
+
+- The UI thread has no business holding the master secret.
+- Showing it in the chat window means screen-shares, screenshots, and shoulder-surfing all leak it.
+- The intended exposure surface is exactly what you have now: a one-time terminal print, plus a file the user can back up themselves.
+
+A real app would still need to *let* the user see the mnemonic (for backup), but typically behind a deliberate "Show recovery phrase" gesture: re-auth with a device passphrase, full-screen modal, blur the rest of the UI, etc. Not on the message list.
+
+### Security caveats worth knowing
+
+The example's storage choice is fine for a **study repo**, sketchy for a **real app**:
+
+- **Plaintext on disk.** Anyone with read access to your machine — another local user, a backup, a leaky cloud-sync folder, a rogue process — can grab the mnemonic and become you. There's no encryption-at-rest, no OS keychain, no passphrase.
+- **`/tmp` is the wrong place for anything you want to keep.** On Linux, `/tmp` is often `tmpfs` and gets wiped on reboot. macOS keeps it persistent but periodic cleanups can prune old files. Either way, "I rebooted and lost my identity" is a foot-gun. Use a stable path like `~/.pearschool-identity/user1` for actual use; `/tmp/...` is fine only because this is a throwaway demo.
+- **`--store` and the mnemonic file are bound.** Delete the store directory, and you've deleted the identity (modulo whatever you backed up out of `--mnemonic`). The `--reset` flag in `worker/index.js:25-27` only wipes the corestore subdirectory but leaves `identity-mnemonic.txt` alone — which is good (you keep your identity across resets) but worth knowing if you're trying to test a totally fresh identity (`rm -rf /tmp/identity-user1` instead).
+
+For a real app, replace plaintext + `/tmp` with: OS keychain (macOS Keychain, Windows DPAPI, libsecret on Linux), or encrypt-at-rest with a user passphrase, or a dedicated key store like `keytar`/`bare-secure-storage` if available. The `keet-identity-key` API is agnostic — `Identity.from({ mnemonic })` doesn't care where the mnemonic came from.
+
+---
