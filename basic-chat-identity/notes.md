@@ -278,3 +278,48 @@ For PearSchool, identity isn't a nice-to-have — it's load-bearing for **three*
 Without identity, PearSchool would have to put a server in the middle to vouch for any of these. With it, the school is just "an instructor's identity public key + an autobase + some students."
 
 ---
+
+## Q: I ran the README's `pear run --store /tmp/user1 . --name user1` and got `Uncaught Error: Unknown collection type: 18`. What's going on?
+
+### What the error means
+
+```
+Uncaught Error: Unknown collection type: 18
+    at Object.collection1_reconstruct [as reconstruct] (pear://dev/spec/db/index.js:95:25)
+    at BeeEngine.finalize (pear://dev/node_modules/hyperdb/lib/engine/bee.js:171:38)
+```
+
+HyperDB opened the on-disk view, started reading records, hit a record stamped with collection-type ID `18`, and that ID isn't registered in this folder's generated `spec/db`. So it aborts.
+
+### Why it happened
+
+The `/tmp/user1`, `/tmp/user2`, `/tmp/user3` paths the README suggests are the *exact same paths* the README of the previous folders (`basic-chat`, `basic-chat-blind-peering`) suggests. So if you've been working through the examples in order — which is the whole point of this study repo — those store directories already exist on your machine, populated by an earlier example's app.
+
+Each example has a different schema:
+
+- Different namespace: `basic-chat-identity` here (`schema.js:11-12`) vs `basic-chat-blind-peering` next door.
+- Different set of dispatch entries with different offsets (`schema.js:58-63`).
+- Different collection IDs assigned by `hyperdispatch` at build time.
+
+That metadata is **baked into every block** the autobase writes. When this folder's HyperDB opens a corestore that was written by a different folder's schema, the bytes are still there but the collection-ID table doesn't match. It reads a record tagged `18`, looks it up, and crashes.
+
+### Two ways to fix
+
+**Option A — reset the existing store.** The flag is handled at `worker/index.js:25-27`:
+```sh
+pear run --store /tmp/user1 . --name user1 --reset
+```
+Caveat: `--reset` wipes `<storage>/corestore`, which also takes the persisted mnemonic file with it. You'll come up with a fresh identity. Fine for a clean slate, not what you want if you're testing identity continuity.
+
+**Option B — folder-scoped store paths (recommended for the study repo).** Sidestep the collision entirely:
+```sh
+pear run --store /tmp/identity-user1 . --name user1
+pear run --store /tmp/identity-user2 . --name user2 --invite <invite>
+```
+Each example gets its own namespace on disk. You can hop between folders without `--reset` dances and without losing identities. The README has been updated to use this pattern.
+
+### Takeaway
+
+The `pear run --store ...` path is **not** just a working directory — it's the corestore root, and the schema that wrote those blocks travels with the bytes. Treat one store as bound to one app/schema.
+
+---
