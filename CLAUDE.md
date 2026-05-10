@@ -25,3 +25,13 @@ When writing or editing a folder's `README.md`:
 - **Include a brief explanatory note** above the first `pear run` block explaining why the path is folder-scoped (link the failure mode: `Unknown collection type: N`). `basic-chat-identity/README.md:9` and `basic-chat-multi-rooms/README.md` are the reference templates.
 
 This keeps every example's on-disk data isolated so Storyteller can hop between folders without `--reset` dances and without losing any folder's existing state.
+
+## Folder-scoped improvement ideas (`new-features.md`)
+
+When Storyteller (or you, while studying) spots a concrete way the code in an example folder could be improved or extended, capture it in a `new-features.md` **inside that folder**. This is the forward-looking counterpart to `notes.md` — keep them separate so study Q&A doesn't get tangled with speculative roadmap items.
+
+- One `new-features.md` per example folder. Create on first idea; append thereafter.
+- Each entry should state **what** is sub-optimal or missing, **why** it matters (concrete failure mode or UX gap, not vague "best practice"), and a **rough how** sketch. Anchor every claim to code with `path:line`.
+- Keep ideas **folder-scoped** — they describe changes to *this* example, not cross-folder refactors. Cross-folder ideas belong in a top-level summary if Storyteller asks for one.
+- Same formatting rules as `notes.md`: bulleted lists or sub-headings, no Markdown tables.
+- `basic-chat-multi-rooms/new-features.md` is the reference template.
