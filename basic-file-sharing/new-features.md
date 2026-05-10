@@ -54,3 +54,142 @@ So a file dragged from `~/Downloads/foo.pdf` ends up living in **two** places: t
 - **Name collision.** If `my-drive/` already has a file with the same name, `rename` overwrites silently on POSIX. Either rename-with-suffix or surface an error to the UI.
 - **Permission errors on the source.** Files dragged from system-protected locations (e.g. `/Volumes/<read-only>/`, sandboxed directories on macOS) may not be deletable. Catch `EACCES`/`EPERM` and fall back to copy semantics with a UI toast like "Original kept (read-only source)".
 - **Drag-from-browser / temp files.** Drops from a browser window resolve to OS temp paths (via `Runtime.media.getPathForFile`, `ui/root.jsx:20`). Deleting those is harmless and arguably correct — they were going to be GC'd anyway.
+
+## 2. Categorise drives (curriculum / recordings / module-videos / examples / templates / …)
+
+**What.** The example today has exactly one notion of "drive": every peer publishes a single `myDrive` and the autobase view stores a flat `drives` collection (`schema.js:57-61`, `worker/drive-room.js:37-38, 164`). Every drive is a peer of every other drive — there is no way to say "this drive is the syllabus", "this is module-3 videos", "this is the templates folder I'm sharing with TAs". The UI consequently shows one giant flat list grouped only by `info.name` (`ui/root.jsx:51-64`, sort in `worker/worker-task.js:70-74`).
+
+**Why.** The five Pear School use cases in `notes.md` (curriculum, recordings, per-student feedback, module videos, group projects) all want **structurally different drives**, not just different names. They differ on at least four axes:
+
+- **Who can publish** — only the instructor publishes curriculum; any student publishes a submission; TAs publish to templates.
+- **Who replicates** — every student pulls curriculum; only the instructor pulls submissions; TA cohort pulls templates.
+- **Storage policy** — curriculum is fully mirrored (small, durable); module videos are sparse-on-demand (large, viewed once); recordings are mirrored only for the active week.
+- **UI surface** — students want a tabbed sidebar ("Curriculum / Videos / Templates / My submissions"), not a single alphabetised list of 50 drive names.
+
+Encoding category in the free-text `info.name` ("[CURRICULUM] week-1") is the obvious workaround and the wrong one — it's not queryable, not enforceable, and breaks the moment two peers spell it differently.
+
+**Rough how.**
+
+Three layered changes — schema, dispatcher, UI/storage — each independently shippable.
+
+### a. Schema: add a `category` field to the `drive` record
+
+In `schema.js:28-34`, extend the drive shape:
+
+```js
+schema.register({
+  name: 'drive',
+  fields: [
+    { name: 'key', type: 'buffer', required: true },
+    { name: 'category', type: 'string', required: true },
+    { name: 'info', type: 'json' }
+  ]
+})
+```
+
+`category` is a free string at the schema level (no enums in hyperschema), but the **app pins it to a known set** at the dispatcher: `curriculum | recordings | module-videos | examples | templates | submissions | feedback | group-project`. Treat it like an MIME type — open set, but the runtime knows the well-known values.
+
+Then promote it to a queryable index by registering the collection's secondary key:
+
+```js
+db.collections.register({
+  name: 'drives',
+  schema: '@basic-file-sharing/drive',
+  key: ['key']
+})
+db.indexes.register({
+  name: 'drives-by-category',
+  collection: '@basic-file-sharing/drives',
+  key: ['category', 'key']
+})
+```
+
+Now `view.find('@basic-file-sharing/drives-by-category', { gte: { category: 'curriculum' }, lt: { category: 'curriculum\xff' } })` is an O(log N) prefix scan instead of full-table filter. Matters when a course has 50 students × 5 categories = 250+ drive rows.
+
+### b. Dispatcher: enforce who-can-publish-what at the autobase op layer
+
+Today `_setupRouter` (`worker/drive-room.js:131-141`) blindly inserts every `add-drive` op:
+
+```js
+this.router.add('@basic-file-sharing/add-drive', async (data, context) => {
+  await context.view.insert('@basic-file-sharing/drives', data)
+})
+```
+
+Replace with a category-aware policy check:
+
+```js
+this.router.add('@basic-file-sharing/add-drive', async (data, context) => {
+  const writerKey = context.node.from.key   // exposed by autobase apply context
+  if (!isAllowedToPublish(data.category, writerKey, this.policy)) return
+  await context.view.insert('@basic-file-sharing/drives', data)
+})
+```
+
+Where `this.policy` is built from the room's identity claims (when basic-chat-identity merges in: `instructorIdentityPub`, `taIdentityPubs`, `enrolledStudentPubs`). Default policy table:
+
+- **`curriculum`** — instructor only.
+- **`recordings`** — instructor + TAs.
+- **`module-videos`** — instructor only.
+- **`examples`** — instructor + TAs.
+- **`templates`** — instructor + TAs.
+- **`submissions`** — any enrolled student, but only their own (`writerKey === student's key`).
+- **`feedback`** — instructor only, audience-keyed (see entry 1's per-student-feedback note in `notes.md`).
+- **`group-project`** — members of the group only (group membership stored in a sibling collection).
+
+Rejected ops are silently dropped, not erroneously inserted — autobase still records the op in the writer's hypercore, but the view never materialises it. This is the same enforcement pattern multi-rooms uses for cross-writer ops.
+
+### c. Filesystem: namespace `shared-drives/` by category
+
+Today every drive lands in `shared-drives/<key>/` (`worker/worker-task.js:25, 53`). For 250 drives this is unbrowsable in Finder. Group by category:
+
+```
+shared-drives/
+  curriculum/<key>/
+  recordings/<key>/
+  module-videos/<key>/
+  examples/<key>/
+  templates/<key>/
+  submissions/<key>/        # only on instructor's machine
+  feedback/<key>/           # only on the recipient student's machine
+  group-project/<key>/
+```
+
+Change `_downloadSharedDrives` (`worker/drive-room.js:143-160`) to read each drive's `category` from the view row and use `path.join(this.sharedDrivesPath, item.category, key)` instead of the bare `path.join(this.sharedDrivesPath, key)` on line 149. Mirror call to the snapshot loop in `worker-task.js:53` (which currently rebuilds the same path).
+
+There's one own-drive too: `myDrivePath` becomes `myDrivesPath` (plural) and gains a category dimension — a peer might publish *both* a `submissions` drive (their homework) *and* a `templates` drive (a starter pack they're sharing with classmates). Replace the single `myLocalDrive` / `myDrive` pair (`worker/drive-room.js:37-38`) with a `Map<category, { local, drive }>`. `_uploadMyDrive` (`worker/drive-room.js:162-169`) iterates the map.
+
+### d. UI: tabbed groups instead of one flat list
+
+Replace the single `<ul>` in `ui/root.jsx:51-64` with category sections. Pseudo-shape:
+
+```jsx
+const grouped = useMemo(() => groupBy(drives, d => d.category), [drives])
+const order = ['curriculum', 'module-videos', 'recordings', 'examples', 'templates', 'submissions', 'feedback', 'group-project']
+
+return order.filter(c => grouped[c]?.length).map(category => (
+  <section key={category}>
+    <h3 className='font-bold mt-4'>{labelFor(category)}</h3>
+    <ul>{grouped[category].map(renderDrive)}</ul>
+  </section>
+))
+```
+
+The drag-and-drop zone needs a "publish into category…" picker — a `<select>` next to the file input that determines which of the user's category-drives receives the dropped file. Categories the user isn't authorised to publish to are disabled (with a tooltip "instructor only").
+
+### e. Discovery scope: optional, but worth flagging
+
+Today every drive joins the swarm by its own `discoveryKey` (`worker/drive-room.js:158, 165`). For Pear School at scale, you may want to **separate swarm topics by category** so a student running on hotel wifi doesn't discover and start replicating connections for 49 submission drives they have no business pulling. Two options:
+
+- **Per-category swarm topic** — `swarm.join(hash('pearschool/' + courseId + '/' + category))`, drives advertise themselves on their category's topic only. Cheaper discovery, but requires a second coordination layer to map `category → drive keys`.
+- **Per-drive (status quo) + role-gated mirror** — keep current discovery, but the *mirror* logic in `_downloadSharedDrives` skips drives whose category the local peer isn't supposed to pull. Wastes a few connections but keeps the swarm topology simple.
+
+Default to the second; reach for the first only if connection count becomes a problem.
+
+**Migration note.** Existing rooms have flat `drives` rows with no `category`. Treat `category === undefined` as `'legacy'` in the dispatcher and surface it as an "Uncategorised" section in the UI until the room is rebuilt. No need for a migration op — Pear School rooms will be created fresh against the new schema.
+
+**Why this isn't just "use folders inside one drive".** A subdirectory layout inside a single Hyperdrive (`my-drive/curriculum/`, `my-drive/templates/`) seems simpler and is the wrong call for Pear School:
+
+- **Authorisation is at the drive level, not the path level.** Hyperdrive has no per-path ACLs — anyone with the drive's key reads the whole tree. Curriculum and submissions need different audiences, which means different drives, which means different keys.
+- **Replication scope is at the drive level.** You can sparse-fetch within a drive, but you still need the drive's full discovery to mirror anything. Separate drives let you skip whole categories on bandwidth-constrained peers.
+- **Ownership is at the drive level.** Curriculum has one writer (instructor); submissions has one writer per student. A single shared drive would either need a shared writer key (insecure) or autobase-managed multiwriter semantics inside Hyperdrive (which doesn't exist — Hyperdrive is single-writer; multiwriter shared folders are what `autodrive` and the upcoming Hyperdrive-on-Autobase work address, but that's a bigger lift than just splitting drives).
