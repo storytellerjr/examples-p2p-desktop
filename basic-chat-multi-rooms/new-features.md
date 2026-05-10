@@ -139,3 +139,124 @@ The plumbing for this is half-built — the schema and routers already accept `a
 **Why.** Real multi-room chat needs both: per-message authorship (identity) **and** per-room access control (room invites). Multi-device sync (account invites) on top of that gives you Keet's basic shape.
 
 **Rough how.** Re-introduce `proof` on `add-message` and the `Identity.attestData` / `Identity.verify` calls (per `basic-chat-identity/worker/worker-task.js:43-44, 58-63`) inside `ChatRoom`, leaving `ChatAccount` untouched. Account writers don't need per-block identity proofs because the account base only carries metadata, not messages.
+
+## 13. Presence — see who is online (per room)
+
+**What.** No notion of presence anywhere in the app. `worker/worker-task.js:21` wires every swarm connection straight into `store.replicate(conn)`; `worker/chat-room.js:69` joins each room's discovery key but nothing surfaces "who is connected right now". The UI's room view (`ui/root.jsx:40-67`) shows messages only — no member list, no online dots.
+
+**Why.** Concretely framed by Pear School (see the Pear School Q in `basic-chat-identity/notes.md` for the full setup): an instructor needs to see which students are attending the live session before starting; students benefit from seeing their cohort online for study-group formation. Presence is also the prerequisite for typing indicators, "last seen" timestamps, and durable attendance records.
+
+**Rough how.**
+
+This depends on entry 12 (combine with identity layer) for the **"which students"** half of the question — without identity all you can show is anonymous peer counts. Build it in three layers:
+
+- **Layer A — Anonymous peer count (works today, no identity).** Track `swarm.connections` per room's discovery topic. Easiest hook: count peers in `room.base.discoveryKey`'s `swarm.peers` list, debounced, push over HRPC as `presence-count`. Useful as a smoke test and as a fallback when identity is absent. Limitation: a peer with two devices counts as two; a peer that just dropped counts until the swarm notices.
+- **Layer B — Identity-mapped soft presence (needs entry 12).** Open a **Protomux side-channel** on each peer connection (Protomux is already on the wire because corestore replication uses it). On connect, both sides exchange a signed hello:
+  ```js
+  // pseudo
+  const hello = { name, identityPub, deviceKey, sentAt: Date.now() }
+  const helloProof = Identity.attestData(encode(hello), deviceKeyPair, deviceProof)
+  channel.message.send({ hello, helloProof })
+  ```
+  Receiver verifies `helloProof` against `hello.identityPub`, then pins `connection → identityPub`. Heartbeat every ~10s with `{ identityPub, ts }`; mark a peer offline when `lastSeen > 2 * heartbeatInterval`. Maintain `roomId → Map<identityPub, { name, since, lastSeen, devices: Set<deviceKey> }>` so multi-device users (entry that account-invites enable) collapse to one identity in the UI. Push the materialised map over HRPC as `presence-update`.
+- **Layer C — Pear School: durable attendance log (optional, identity-required).** Soft presence is ephemeral — close your laptop, you disappear. For a real classroom you also want a permanent record. Add a `checkin {identityPub, sessionId, at}` op signed by the student's identity (`Identity.attestData`) and append-only on the room base. Instructor can then query "who checked in to session X" weeks later. Rate-limit per identity per session at the dispatcher to avoid log spam.
+
+**UI.** New right-side panel in `ui/root.jsx` per selected room showing the member list with name, identity-shortcode, and an online dot. For Pear School: an instructor-only view (visibility gated by `identityPub === INSTRUCTOR_IDENTITY_PUBKEY`) listing every enrolled student with status `Online | Recently active | Offline | Not yet attended`.
+
+**Privacy / authorization.**
+
+- Anyone connected to a room base can already enumerate its writers from the autobase metadata, so "writer keys are visible" is not new. What presence adds is **identity-binding** ("this writer key right now is held by student S") and **liveness** ("S is connected at this moment").
+- For Pear School, the default should be **mutual visibility within a room** (everyone enrolled in the course sees everyone else online). If the instructor wants invisible/anonymous student mode, gate the presence-hello broadcast behind a `roomPolicy.presenceVisible` flag on the room.
+- The hello's `identityPub` is signed, so a peer cannot impersonate another student even on the protomux channel — this matters when "online" gates anything UX-significant (raise hand, submit attendance).
+
+**Why protomux side-channel and not autobase ops.** Presence is transient and high-frequency (heartbeats every few seconds). Putting it through autobase would balloon the append-only log with noise that has no long-term value. Protomux gives you an out-of-band stream on the connection that's already there — same mechanism Keet uses for typing indicators and the "now playing" track in voice rooms.
+
+## 14. Direct messages — teacher↔student and student↔student DM rooms
+
+**What.** No way to chat 1-to-1. Every conversation today is a `ChatRoom` shown in the public Rooms sidebar (`ui/root.jsx:69-91`); there is no notion of a private peer-to-peer channel that bypasses the manual invite copy/paste step.
+
+**Why.** Pear School use cases (see Pear School Q in `basic-chat-identity/notes.md`):
+
+- **Teacher → student.** Private feedback on a submission, scheduling a 1:1, escalating a flagged answer — none of which belongs in the public course room.
+- **Student → teacher.** Asking a question without broadcasting it to the cohort.
+- **Student ↔ student.** Study partners, group-project coordination. Often gated per course (some instructors want it; others want all interaction on official channels).
+- **Small group DMs.** "The four of us doing the capstone together" — same mechanism, N > 2.
+
+### Core insight: a DM is just a small private room
+
+Mechanically, a DM is a `ChatRoom` with exactly the same wire format and storage layout — autobase, encrypted, blind-paired writers, message dispatch. **The only thing that changes is how the pairing happens** and how the room is presented in the UI.
+
+Concretely:
+
+- One autobase per peer-pair (teacher↔alice, alice↔bob), namespaced in the corestore as `this.store.namespace('dm:' + sortedIdentityPubs.join(':'))`.
+- Two writers in the typical case (one per identity); N writers for a group DM.
+- Stored alongside the public rooms but tagged differently — see schema change below.
+
+So the *room* primitive is unchanged. What needs to be designed is **invite-less pairing**.
+
+### The pairing problem (the actually-new bit)
+
+Today, joining a room means: (1) someone hands you a `z32`-encoded `BlindPairing` invite string, (2) you paste it into `--invite` or the UI's join box (`ui/root.jsx:106-114`), (3) `BlindPairing.addCandidate` does the handshake (`worker/chat-account.js:42-52` and `chat-room.js:39-49`).
+
+For DMs that's user-hostile — clicking "DM Alice" should just work. The fix uses identity (entry 12) as the discovery anchor:
+
+- **Identity-derived DM mailbox topic.** Each identity has an implicit Hyperswarm topic derived from its public key:
+  ```js
+  const mailboxTopic = crypto.hash([Buffer.from('dm-mailbox-v1\0'), identityPub])
+  ```
+  At worker startup, `swarm.join(mailboxTopic)` (alongside the existing account/room topic joins). Anyone who knows your `identityPub` can find you.
+- **DM-request handshake over Protomux.** When the initiator connects to the recipient's mailbox topic, both sides open a `pear-school/dm` Protomux channel (mux it onto the same connection that's already replicating, like presence in entry 13). The initiator sends:
+  ```js
+  {
+    fromIdentityPub,
+    fromName,
+    requestedAt: Date.now(),
+    proof: Identity.attestData(encode({ fromIdentityPub, toIdentityPub, requestedAt }), deviceKeyPair, deviceProof)
+  }
+  ```
+- **Recipient policy gate.** Recipient verifies `proof` against `fromIdentityPub`, then checks a per-deployment policy (see "Policy" below). If accepted: recipient creates a fresh DM `ChatRoom` (its own autobase + namespace), generates a `BlindPairing` invite, and ships `{ key, encryptionKey, invite }` back over the same Protomux channel — encrypted to `fromIdentityPub` so an eavesdropper on the swarm can't snoop.
+- **Initiator pairs in.** Initiator decrypts, calls `BlindPairing.addCandidate` with the invite, becomes a writer. Both parties now share the DM room. The mailbox connection's job is done; from here on it's a normal autobase/replication flow.
+- **Subsequent reconnects skip the handshake.** Once the DM room exists locally on both sides (registered in their account view as a `kind: 'dm'` row, see schema change below), the workers swarm its discovery key directly — same as for any room.
+
+This is essentially `BlindPairing` with the invite delivered over an automatically-discovered side-channel instead of out-of-band paste.
+
+### Policy: who is allowed to DM whom
+
+Same mechanism, different policy per actor pair. Pear School defaults:
+
+- **Teacher → any enrolled student.** Always accepted. Teacher's identity is the trust anchor; students implicitly authorise contact from it on enrollment.
+- **Student → teacher.** Always accepted on the teacher's side (office-hours model). Optionally rate-limited to prevent abuse.
+- **Student → student.** Gated by a course-level flag set by the teacher (`courseRoom.policy.studentDMs: 'open' | 'opt-in' | 'closed'`). On `'opt-in'`, the recipient sees a "Bob wants to DM you — accept?" prompt; on `'closed'`, the request is dropped.
+- **Outsider → anyone.** Drop. The mailbox topic is technically discoverable by anyone with your `identityPub`, but in Pear School the identity-pub list is internal to the course autobase, so this is naturally bounded. Still worth a default-deny for unknown identities.
+
+Implement the policy as a callback on the `dm-request` Protomux handler: `account.onDMRequest = (from, to) => 'accept' | 'reject' | 'prompt'`. Default to `prompt` for unknown identities.
+
+### Schema change
+
+Extend the existing `room` schema in `schema.js:28-36`:
+
+- Add `kind: string` (values `'group' | 'dm' | 'group-dm'`).
+- Add `participants: array of buffer` (identity pubs of the intended members; empty for `kind: 'group'` since group rooms admit by invite, not by identity allowlist).
+
+The router already upserts on `id`, so existing rows stay compatible (default `kind: 'group'` if absent).
+
+### UI
+
+Split the sidebar (`ui/root.jsx:69-91`) into two sections:
+
+- **Direct Messages** (top): rows tagged `kind: 'dm'`, labelled by the *other* participant's display name (resolved from `participants[0|1]` via the identity → name lookup the identity layer maintains). Online dot from entry 13.
+- **Rooms** (below): rows tagged `kind: 'group'`, labelled by `room.name` as today.
+
+Add a "DM" affordance everywhere a user is identified — for instance, click any name in the presence panel from entry 13 → `dmCreateOrOpen(thatIdentityPub)`. If a DM room already exists, surface it; otherwise initiate the handshake described above.
+
+### Dependencies and cross-refs
+
+- **Hard dependency on entry 12** (identity layer) — the mailbox topic is identity-derived, the handshake proves identity, the policy gate identifies parties. Without identity there is no "Alice" to DM.
+- **Soft dependency on entry 13** (presence) — knowing whether the recipient is online lets the UI show "Alice is online" before you start typing, and lets the initiator queue the DM-request retry instead of failing immediately if the recipient is offline.
+- **Builds on existing primitives** — no new Holepunch component is required. `BlindPairing`, autobase encryption, Protomux side-channels, identity attestation are all already in scope. The new code is the mailbox-topic-join, the Protomux channel handler, the policy callback, the schema `kind` field, and the UI split.
+
+### What to skip in a v1
+
+- **Forward-secrecy / Signal-style ratchets.** Autobase's per-block encryption is fine for Pear School's threat model; layering Signal Protocol on top is overkill until there's a concrete reason.
+- **Self-DMs.** Mechanically work (single-writer room) but UX-noise; just hide them.
+- **Read receipts and typing indicators.** Both belong on the same Protomux side-channel as presence (entry 13) — defer until presence lands.
