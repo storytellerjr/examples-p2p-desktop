@@ -36,6 +36,52 @@ Limitations to flag honestly before pitching this for Pear School lessons:
 - No moderation surface on comments (no delete, no rate-limit, no ban) — fine for trusted cohorts, not yet defensible against bad actors.
 - The 2-second-GOP latency floor (`worker/live-cam-room.js:217`) makes anything that needs back-and-forth interactivity (e.g. a Socratic-style seminar where the instructor reads the room) feel sluggish. Feature 4 (quality presets) helps but doesn't eliminate this.
 
+## Q: Where are the video fragments stored, what happens when the broadcaster drops, and is there blind mirroring of the whole stream?
+
+There are **two storage layers** in this app — once you separate them, the broadcaster-drop and mirroring questions answer themselves.
+
+### Layer 1 — autobase view (HyperDB): metadata only
+
+- One per peer, in `Pear.app.storage/corestore/` (set by `--store`).
+- Holds rows in four collections (`@basic-live-cam/invites`, `/videos`, `/messages`, `/add-writer` — see `spec/db`).
+- A `/videos` row is just a **pointer**: `{ id, blob: { key, blockOffset, blockLength, byteOffset, byteLength }, info: { fragIdx } }`. The actual video bytes are **not** in this row. See `worker/live-cam-room.js:266-272`.
+- This view core is **eagerly fully downloaded** on every peer: `this.view.core.download({ start: 0, end: -1 })` at `worker/live-cam-room.js:83`. So every joiner pulls every metadata row, indefinitely.
+
+### Layer 2 — Hyperblobs core: the actual video bytes
+
+- A **single, separate hypercore** named `'blobs'`, owned by the broadcaster's corestore: `this.blobs = new Hyperblobs(this.store.get({ name: 'blobs' }))` at `worker/live-cam-room.js:35`.
+- Every MP4 fragment FFmpeg produces is appended as a new blob inside this **one** core (`_onNewFragment` at `worker/live-cam-room.js:260-273`). All fragments share the same `blob.key` — only `byteOffset`/`byteLength` differ between rows.
+- A `hypercore-blob-server` runs in-process on each peer (`worker/live-cam-room.js:36, 101`). It serves byte-ranges out of the local corestore over HTTP so the React UI can `fetch(link)` (`ui/root.jsx:42-46`).
+- Joiners learn the blob core's key from the metadata row, open the remote core via `this.store.get({ key })`, and **join the swarm on the blob core's discovery key** the first time they see any video row (`worker/live-cam-room.js:182-188`). Subsequent rows hit the cache at `this.blobsCores[item.blob.key]`, so this happens once per joiner, not per fragment.
+
+### What this means for "blind mirroring of the whole video"
+
+Almost, but not eagerly:
+
+- **Metadata** (the `/videos` rows) is force-downloaded on every peer (`worker/live-cam-room.js:83`). So every peer knows about every fragment that ever existed.
+- **Bytes** are pulled **on demand** by the playback loop at `ui/root.jsx:36-49`. There is **no** explicit `blobsCore.download({ start: 0, end: -1 })` in this codebase, so hypercore's default sparse replication applies — a peer only fetches the blocks the blob server asks for.
+- The playback loop walks fragments in order from `fragIdx=0`, so **in practice anyone who watches the broadcast end-to-end ends up with the full byte set in their local corestore**, and once it's there it stays — hypercore is append-only and the corestore doesn't garbage-collect.
+- A peer who joins but never opens the room (or scrubs away before fragment N) will not have the bytes for fragment N+1, even though they have the metadata for it.
+
+So "blind mirroring" is **effectively yes if you watch, no if you don't**. There's no eager pre-fetch of the whole stream.
+
+### What happens after the broadcaster drops
+
+The broadcaster going offline does **not** kill the room. Concretely:
+
+- **Comments and metadata up to the drop persist on every joiner.** They were already replicated into each joiner's local view core (eager download, see above), so they remain visible and the comment thread still renders.
+- **Video bytes up to the drop persist on whichever peers downloaded them.** A joiner who watched fragments 0–N has those bytes in their local corestore. They will continue to **serve** those bytes to any other peer connected to them on the swarm — the autobase view core and the blob core are both being announced from every peer that has them, not only from the broadcaster.
+- **A late joiner can still watch a recording of the dropped broadcast**, *provided at least one peer who has the bytes is online*. The late joiner gets the metadata from the swarm (any peer can serve it), opens the blob core, requests the bytes, and the playback loop walks `fragIdx=0` upward. From their perspective the broadcaster's offline status is invisible — bytes flow from whoever has them.
+- **New comments still work.** Any peer is a writer on the autobase once `addWriter` has run for them (`worker/live-cam-room.js:91-97` — `pairMember.onadd` calls `addWriter` for every joiner). The HRPC `addMessage` flow at `worker/worker-task.js:35-37` appends locally and replicates to anyone connected, regardless of whether the broadcaster is online.
+- **What stops** is new video. The broadcaster is the only source of `_onNewFragment` events because of the `if (!this.invite) this._startLiveCam()` guard at `worker/live-cam-room.js:103`. No broadcaster → no new fragments → no growth in the blob core. Viewers reach the last `fragIdx` and the playback loop sits at `await new Promise(resolve => setTimeout(resolve, 100))` (`ui/root.jsx:38-40`) waiting for fragments that never arrive.
+- **What stops absolutely** is when the *last* peer holding the bytes goes offline. There is no persistent seeder, no DHT-pinned mirror — durability is "whoever happens to have a corestore open". For Pear School use cases that need replay-after-the-fact, this is a real gap (worth a future-feature entry: a "always-on seeder" peer, or pinning to a Hyperbee/Hyperdrive durability service).
+
+### One-line summary
+
+- Metadata: one autobase view core per peer, force-downloaded, holds pointers to bytes.
+- Bytes: one Hyperblobs hypercore on the broadcaster, replicated sparsely on-demand to viewers as they play.
+- Broadcaster drops → existing content remains playable as long as at least one peer with the bytes is online; only *new* fragments stop.
+
 ## Q: How can I test this on one computer?
 
 Yes — it's designed to run both peers on one machine. Only **user1** (the one started *without* `--invite`) actually opens the webcam — see the `if (!this.invite) this._startLiveCam()` guard at `worker/live-cam-room.js:103`. user2 (and any further joiners) just receive the encoded video fragments via blob replication and replay them, so there's no camera-contention between the two windows.
