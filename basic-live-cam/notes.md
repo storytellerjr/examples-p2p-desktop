@@ -12,6 +12,30 @@
 
 So in spirit it's: **"share my camera with my friends, and let us all chat under it, with no middleman."** The "basic" in the name means it's the smallest possible working version — one broadcaster, one ongoing video stream, one comment feed, peer-to-peer over the Pear/Holepunch stack.
 
+## Q: What Pear School use cases does this folder enable?
+
+`basic-live-cam` is the foundation for any Pear School experience that needs **one person broadcasting live to many, with a synchronous text backchannel, and no server in the middle**. Several concrete classroom shapes fall out of it (most are stronger once features 1–3 in `new-features.md` — audio, device pickers, screen-share — are in place):
+
+- **Live lectures.** Instructor broadcasts face + voice + slides (or whatever's on screen) to a cohort. Each student joins with the same invite; the comments box becomes the live Q&A backchannel without disrupting the lecturer's audio. No streaming-server bill — peers carry the load.
+- **Office hours / 1:1 tutoring.** Tutor and student in a two-peer room. The persistent comment thread *is* the session notes — the student keeps the corestore around and the conversation stays browseable as plain text, anchored to the same time as the recording.
+- **Code-along / pair-programming sessions.** Once screen-share (feature 3) lands, an instructor shares an IDE while talking; students follow along and ask questions in the comments without interrupting. Same room model as lectures, just a different capture source.
+- **Student presentations + structured feedback.** A student becomes broadcaster, classmates join, and feedback flows into the comment thread tagged with each peer's `--name`. The instructor can later read the thread as a record of who-said-what and grade or summarise it.
+- **Cohort standups / study groups.** Students self-host a daily room — no admin spinning up a Zoom link, no account creation barrier. Anyone with the invite joins.
+- **Guest-speaker events.** Instructor generates an invite and forwards it to an external speaker; the speaker becomes broadcaster for the day. No platform login, no calendar dance.
+- **"Show your work" sessions.** Student points a phone or webcam at their paper notes, a physical experiment, or a hardware build. Same pipeline, no special tooling.
+
+Two architectural facts make Pear School use of this app structurally interesting compared to off-the-shelf Zoom / Twitch:
+
+- **The session is persistent, not ephemeral.** Every video fragment and every comment is appended to an autobase view (`worker/live-cam-room.js:138-143, 268-272`). A student who missed the class can join the room later and the playback loop (`ui/root.jsx:30-49`) walks the fragments from `fragIdx=0` — so they get the lecture *and* the chat in correct order, without anyone having to "publish a VOD" or "share the recording link". The recording, the chat, and the live experience are the same object.
+- **Joiners don't need accounts, only an invite.** The invite is a `blind-pairing` token (`worker/live-cam-room.js:151-161`); pairing happens on the swarm. For a school product, that means a student onboards with a single link and zero identity setup, and an instructor controls access by who they shared the invite with.
+
+Limitations to flag honestly before pitching this for Pear School lessons:
+
+- No audio yet — see feature 1 in `new-features.md`. A lecture-style use case is not viable until audio ships.
+- The broadcaster is fixed at room creation (`if (!this.invite) this._startLiveCam()` at `worker/live-cam-room.js:103`). Roles can't rotate — useful for "instructor broadcasts" but not for "student takes over for their presentation" without restarting the app.
+- No moderation surface on comments (no delete, no rate-limit, no ban) — fine for trusted cohorts, not yet defensible against bad actors.
+- The 2-second-GOP latency floor (`worker/live-cam-room.js:217`) makes anything that needs back-and-forth interactivity (e.g. a Socratic-style seminar where the instructor reads the room) feel sluggish. Feature 4 (quality presets) helps but doesn't eliminate this.
+
 ## Q: How can I test this on one computer?
 
 Yes — it's designed to run both peers on one machine. Only **user1** (the one started *without* `--invite`) actually opens the webcam — see the `if (!this.invite) this._startLiveCam()` guard at `worker/live-cam-room.js:103`. user2 (and any further joiners) just receive the encoded video fragments via blob replication and replay them, so there's no camera-contention between the two windows.
