@@ -82,6 +82,67 @@ The broadcaster going offline does **not** kill the room. Concretely:
 - Bytes: one Hyperblobs hypercore on the broadcaster, replicated sparsely on-demand to viewers as they play.
 - Broadcaster drops → existing content remains playable as long as at least one peer with the bytes is online; only *new* fragments stop.
 
+## Q: I killed user1 (the broadcaster). user2 is still running and saw the full stream. I started a fresh user3 with the same invite — user3 sees nothing. Why, when the previous Q said the room "survives the broadcaster dropping"?
+
+Both can be true. The room *can* survive the broadcaster dropping for **peers already in it** — but a fresh peer that joins *after* the broadcaster is gone has to clear a stack of cold-start hurdles that all run through user2 alone, and any one of them stalling produces exactly the "user3 sees a blank window" symptom you saw. Walking the chain from the top:
+
+### 1. Pairing has to land — through user2, not user1
+
+When user3 runs with `--invite`, blind-pairing only resolves once a **member** on the same swarm topic responds. Both user1 and user2 register as members at `_open()` (`worker/live-cam-room.js:85-98`), and the pairing topic is derived from the autobase's discoveryKey (which user1 and user2 both announce — `worker/live-cam-room.js:80`). So **user2 is a valid pairing server**.
+
+But two things can stall this in practice:
+
+- **DHT staleness.** Hyperswarm peer-records for the autobase's discoveryKey were announced primarily by user1 while it was online. When user1 quits, the DHT records expire on their own clock (minutes). Until they do, user3 may try to dial user1's stale address and time out before finding user2.
+- **The `addMember` callback runs `addWriter`**, which calls `this.base.append(...)` (`worker/live-cam-room.js:90-92`). This is a write to user2's local writer core. The write succeeds locally and is replicated over the **new** user2↔user3 connection. user3 only becomes `writable` (`worker/live-cam-room.js:81`) once that op has linearised in user3's autobase. So: pairing-resolve waits on a swarm round-trip, a write, and a replicated apply pass — all between user2 and user3 alone.
+
+If pairing hasn't completed yet, the worker is still sitting in `await this.pairing.addCandidate({...})` (`worker/live-cam-room.js:51-60`) — the autobase isn't even open on user3, the UI shows the initial empty state, and nothing flows.
+
+### 2. Autobase bootstrap needs user1's writer core, fetched through user2
+
+The autobase's bootstrap is **user1's local core** — the autobase's `key` is user1's local-core key. To replay the view (and see the `/videos` rows), user3 must replicate user1's writer core. user1 is gone, so it has to come from user2's corestore.
+
+This works in principle because corestore replication is multiplexed over every swarm connection (`worker/live-cam-room.js:20`), but corestore only replicates cores both sides are interested in. user3 expresses interest by opening the autobase (`new Autobase(store, key, ...)`); user2 has the core; the new connection multiplexes the blocks across. It's an extra hop compared to the live case — and again, all of it is on user2's shoulders alone.
+
+If user2 is busy or the link is flaky, user3's view can stay empty for a while. While it's empty, `this.base.on('update', ...)` (`worker/live-cam-room.js:74-77`) never fires → `debounceVideos()` never runs → `getVideos` never runs → no blob cores are opened on user3 → no swarm topic is joined for the bytes → the playback loop sits at `await setTimeout(100)` looking at an empty `videosRef.current` (`ui/root.jsx:36-40`).
+
+### 3. The blob core is *announced* by user2, but *bytes* are pulled lazily
+
+Even once user3's view is populated and `getVideos` opens the blob core (`worker/live-cam-room.js:184-188`), the bytes still aren't there. Two notes from the previous storage Q apply directly:
+
+- **The view core is force-downloaded** (`worker/live-cam-room.js:83`: `this.view.core.download({ start: 0, end: -1 })`). The blob core is **not** — there is no `blobsCore.download(...)` anywhere in the codebase.
+- The playback loop fetches fragment N via the local blob server (`ui/root.jsx:42`: `await fetch(fragment.info.link)`), which reads from the local hyperblobs. If those blocks aren't local yet, hypercore replication requests them on demand from a connected peer who has them — i.e. user2.
+
+So bytes flow over the user2↔user3 connection one fragment at a time as the UI tries to play them. While that's pending, the `<video>` element shows nothing (no init segment appended yet) and the comments list may also look empty because the `/messages` rows ride the same view-core replication chain as `/videos`.
+
+### 4. What you saw is consistent with any of these stalling
+
+The most common practical reasons "user3 sees nothing" persists for tens of seconds even though the architecture supports it:
+
+- Hyperswarm hasn't yet routed user3 to user2 (DHT cache still has stale user1 records).
+- Pairing completed but the `add-writer` op hasn't propagated back to user3, so the autobase is still awaiting `writable`.
+- All of the above happened, but user2's first 'update' event on user3's side hasn't fired yet, so `getVideos` hasn't run.
+- Everything is wired and the first fragment's bytes are still in flight.
+
+All of these self-resolve given time — typically under a minute on a single machine where the loopback DHT is fast, longer over real networks. But there is **no progress indicator** in the UI, so a user looking at a blank `<video>` element with no `Invite: …` heading change has no way to distinguish "still pairing" from "permanently broken".
+
+### Quick diagnosis path
+
+If this happens again, the worker logs are the source of truth:
+
+- `console.log` lines at `worker/index.js:35-37` print `Storage`, `Name`, and `Invite` *only after* `workerTask.ready()` and `getInvite()` return. If you don't see those three lines on user3's stdout, pairing hasn't completed yet — wait.
+- If those lines printed but the video stays blank, the view is replicating but the bytes aren't. Worth confirming user2's process is still alive and on the network.
+- Killing user2 *as well* removes the last seeder for the bytes — that case is genuinely unrecoverable until at least one peer with the data comes back.
+
+### Why this is a real architectural gap worth a future-feature entry
+
+Even if every cold-start hurdle above is patient enough to clear, the design is fragile by construction: the **only** peer carrying user1's data is user2, and the **only** way new joiners can backfill is by sequentially streaming through user2's connection on demand. There is no:
+
+- explicit `blobsCore.download({ start: 0, end: -1 })` to eagerly mirror bytes onto every joiner,
+- "always-on seeder" peer that pins the data,
+- progress UI to let a fresh joiner know the broadcast is in the middle of catching up rather than empty.
+
+For Pear School use cases that depend on replay-after-the-fact (missed-lecture playback, asynchronous review of a recorded session), this is a real gap. See `new-features.md` — worth a dedicated entry on durability and cold-join UX.
+
 ## Q: How can I test this on one computer?
 
 Yes — it's designed to run both peers on one machine. Only **user1** (the one started *without* `--invite`) actually opens the webcam — see the `if (!this.invite) this._startLiveCam()` guard at `worker/live-cam-room.js:103`. user2 (and any further joiners) just receive the encoded video fragments via blob replication and replay them, so there's no camera-contention between the two windows.
