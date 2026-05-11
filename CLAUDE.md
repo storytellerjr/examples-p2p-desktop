@@ -4,6 +4,10 @@ This repo is a **study project** by **Storyteller** of the **pearopen** reposito
 
 Storyteller is a pseudonym (the user's nym in the Pear Baby Room on Keet, and the handle on the GitHub account `storytellerjr` where these notes will be pushed). **Never write the user's real name in any file in this repo or in any file Claude creates** — including notes, commits, READMEs, code comments, or memory. Use "Storyteller" everywhere.
 
+## Current focus
+
+`basic-photo-backup/` is the active study folder. `basic-live-cam/` wrapped on 2026-05-10 (notes, future-features, and Pear School use cases pushed). Study sessions resume in `basic-photo-backup/` on 2026-05-11.
+
 ## How to take notes
 
 When Storyteller asks questions about an example folder (e.g. `basic-chat-blind-peering/`, `basic-chat/`, `basic-file-sharing/`, etc.), append the Q&A to a `notes.md` **inside that folder**. Create the file if it doesn't exist. Each note should be self-contained so the folder can be read on its own later.
