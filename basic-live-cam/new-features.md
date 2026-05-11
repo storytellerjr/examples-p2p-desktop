@@ -70,3 +70,33 @@ The dropdowns are broadcaster-only — they make no sense on the joining peers (
 - **Privacy warning.** Screen-share has obvious leak potential — notifications, password managers, other browser tabs. Add a confirm-before-broadcast dialog the first time the user selects *Screen*, similar to Zoom's "everyone will see this preview" step, plus a persistent banner in the UI while screen-share is live so the broadcaster can't forget the stream is going.
 
 Like the device pickers, the screen-share controls are broadcaster-only. Joiners just receive whatever fragments arrive — the receiving code in `ui/root.jsx:30-49` doesn't care whether the bytes started life as a camera or a screen.
+
+## 4. Quality / latency presets to reduce playback lag
+
+**What.** A noticeable delay (typically several seconds) between what the broadcaster does and what the viewer sees, plus occasional stalls. The current FFmpeg pipeline ships at native camera resolution and unconstrained bitrate, with a 2-second-GOP fragment boundary (`worker/live-cam-room.js:197-223`):
+
+- `-framerate 30` at the input, no `-video_size` cap → the encoder runs at the camera's native resolution (often 1280×720 or 1920×1080).
+- `-preset ultrafast -tune zerolatency` is already good on the encoder side.
+- `-g 60` → one keyframe every 60 frames = every 2 seconds at 30fps.
+- `-movflags frag_keyframe+empty_moov+default_base_moof` → each MP4 fragment ends at a keyframe boundary, i.e. each fragment is one full GOP ≈ 2 seconds of video.
+- No `-b:v` / `-maxrate` / `-bufsize`, so the encoder is free to emit large keyframes.
+
+Combined with the replication path (each fragment is written to `Hyperblobs` at `worker/live-cam-room.js:261-265`, appended to the autobase view at `:268-272`, fetched over `hypercore-blob-server` by the viewer at `ui/root.jsx:42-46`), the structural latency floor is roughly: *time to fill one GOP* + *time to replicate the fragment over the swarm* + *MediaSource append + decode*. The first term alone is ~2 s by configuration.
+
+**Why.** For face-cam and screen-share interactions, multi-second lag breaks the feel — comments arrive before the reaction, screen pointers feel disconnected from the broadcaster's voice (once audio lands — feature 1). The example is impressive as a P2P proof-of-concept but feels broken as a "live" app. Letting the broadcaster trade resolution / framerate for responsiveness fixes both the perceived lag and the bandwidth burst on slow links.
+
+**Rough how.**
+
+- **Add a quality preset selector** to the broadcaster UI (`ui/root.jsx`), next to the device pickers from feature 2. Three presets is enough:
+  - *Low / responsive* — 480×270, 15 fps, `-b:v 400k -maxrate 600k -bufsize 800k`, `-g 15` (1 s keyframe interval). Fragments ≈ 1 s each. Best for chat-style usage on flaky networks.
+  - *Medium* — 640×360, 24 fps, `-b:v 800k -maxrate 1.2M -bufsize 1.6M`, `-g 24`. Default.
+  - *High* — current behaviour (native res, 30 fps, `-g 60`). Lowest latency-floor only when bandwidth is abundant on both sides.
+- **Wire the preset into FFmpeg.** In `_startLiveCam` (`worker/live-cam-room.js:196`) replace the hard-coded `FF_INPUT` and `FF_OUTPUT` arrays with values built from the active preset. Add `-video_size WxH` to the input (avfoundation/v4l2/dshow all accept it). Add `-b:v`, `-maxrate`, `-bufsize`, and a smaller `-g` to the output.
+- **Switch live.** Reuse the FFmpeg respawn pattern from features 2 and 3 (`this.ffmpeg?.kill('SIGKILL')` at `worker/live-cam-room.js:107`). Same MediaSource caveat applies — resolution changes mid-stream may require a SourceBuffer rebuild; the simplest path is to tear down and recreate the `MediaSource` on the viewer side when a new "init segment" arrives. Mark the autobase row with a `presetVersion` field so the viewer can detect the change in `ui/root.jsx:36-49`.
+- **Persist the choice.** Save the last-used preset in localStorage so a returning broadcaster keeps their setting, mirroring the device-picker persistence from feature 2.
+
+**Caveats — what this won't fix.**
+
+- The GOP-sized fragment boundary is a structural latency floor. Even at *Low / responsive* the viewer can't start playback until at least one full fragment (≈ 1 s) has been replicated. Reducing `-g` below ~10 frames raises bitrate sharply (more keyframes) for diminishing latency returns.
+- The viewer's playback loop polls every 100 ms for the next fragment (`ui/root.jsx:38-40`). On a fast link that's fine, but bursty fragment arrival can stall playback briefly. A `setInterval`-driven push from `useWorker` (`lib/use-worker.js`) would be tighter but is a separate refactor.
+- Cross-peer clock and bandwidth heterogeneity means joiners on slow links will lag joiners on fast links — there is no adaptive-bitrate ladder here (and adding one is much bigger than a preset switch).
