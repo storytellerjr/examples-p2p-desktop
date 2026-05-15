@@ -193,3 +193,33 @@ Default to the second; reach for the first only if connection count becomes a pr
 - **Authorisation is at the drive level, not the path level.** Hyperdrive has no per-path ACLs — anyone with the drive's key reads the whole tree. Curriculum and submissions need different audiences, which means different drives, which means different keys.
 - **Replication scope is at the drive level.** You can sparse-fetch within a drive, but you still need the drive's full discovery to mirror anything. Separate drives let you skip whole categories on bandwidth-constrained peers.
 - **Ownership is at the drive level.** Curriculum has one writer (instructor); submissions has one writer per student. A single shared drive would either need a shared writer key (insecure) or autobase-managed multiwriter semantics inside Hyperdrive (which doesn't exist — Hyperdrive is single-writer; multiwriter shared folders are what `autodrive` and the upcoming Hyperdrive-on-Autobase work address, but that's a bigger lift than just splitting drives).
+
+## 3. Folder upload (drag a directory tree into the drop zone)
+
+**What.** Today the drop zone in `ui/root.jsx:36-50` only accepts individual files — dragging a folder either silently does nothing or lands a phantom zero-byte entry. The HRPC `add-file` shape (`schema.js:40-47, 78-81`) and the worker handler (`worker/worker-task.js:45-47`) both assume a single leaf file at a time, so even if the UI sent a path-like `name`, the worker would flatten it.
+
+**Why.** Folder upload is a prerequisite for the categorised-drives work in entry 2 to be usable in practice. Every Pear School category is naturally a tree:
+
+- **Curriculum** — `week-1/lecture.pdf`, `week-1/exercises/`, `week-2/…`.
+- **Module videos** — `module-3/lesson-2.mp4` plus chapter markers, transcripts.
+- **Examples & templates** — project scaffolds with `src/`, `tests/`, `README.md`.
+
+Without folder upload, an instructor publishes each file individually and then manually arranges them into subdirectories on disk *after* the fact, which round-trips them through the LocalDrive→Hyperdrive mirror twice and is hostile to anyone publishing more than a handful of files. Once Pear School courses ship real curricula, this stops being convenience and becomes the bottleneck.
+
+The fortunate part: **only the input side is broken.** The downstream pipeline (LocalDrive ↔ Hyperdrive mirror, the snapshot loop's recursive `fs.readdir`, the UI's `file://` link list) already handles nested paths correctly. So the fix is bounded to the UI input, the HRPC contract, and the worker's `add-file` handler.
+
+**Rough how.** Four coordinated changes that have to land together:
+
+1. **UI: walk the dropped tree.** Replace `e.dataTransfer.files` (`ui/root.jsx:11`) with `e.dataTransfer.items[]` + `webkitGetAsEntry()` recursion. Add `webkitdirectory` to the file input (`ui/root.jsx:42-48`) so the OS picker exposes "select folder" mode. For each leaf, compute the relative path from the drop root.
+2. **HRPC: carry the relative path.** Reuse `name` and document that it may contain `/` — Hyperdrive paths are slash-delimited strings already. (Alternative: add a `path` field to `@basic-file-sharing/file` in `schema.js:40-47`. Less ambiguous but requires a schema regen.)
+3. **Worker: `mkdir -p` before copy.** In `worker/worker-task.js:45-47`:
+   ```js
+   const dest = path.join(this.myDrivePath, data.name)
+   await fs.promises.mkdir(path.dirname(dest), { recursive: true })
+   await fs.promises.copyFile(data.uri, dest)
+   ```
+4. **Or batch at the worker.** Alternative to leaf-by-leaf: add an `add-folder` HRPC method that takes a single root URI and have the worker walk it with `fs.cp(src, dest, { recursive: true })`. Less network chatter on the IPC channel, but loses per-file progress reporting.
+
+**See also.** `notes.md` — the Q "I dragged a folder with sub-folders into the drop zone and nothing happened. Are folders just not supported?" walks through the layer-by-layer analysis (HTML5 drag event → file→URI step → HRPC contract → worker handler) that this entry's *why* and *rough how* are condensed from. Read that first if the *why each layer breaks* matters before touching code.
+
+**Interaction with entry 1 (delete after upload).** If both ship, the "delete original" semantics need a pass on directories: `fs.rename` on a dir works on POSIX same-volume; cross-volume needs `fs.cp` + recursive delete. Worth a single test case per OS.

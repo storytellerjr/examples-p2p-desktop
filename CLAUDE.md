@@ -6,7 +6,11 @@ Storyteller is a pseudonym (the user's nym in the Pear Baby Room on Keet, and th
 
 ## Current focus
 
-`basic-photo-backup/` is the active study folder. `basic-live-cam/` wrapped on 2026-05-10 (notes, future-features, and Pear School use cases pushed). Study sessions resume in `basic-photo-backup/` on 2026-05-11.
+`basic-video-stream/` was opened on 2026-05-15 and **skipped after a quick scan** — it does not introduce a new Holepunch primitive; it is a UI variant of `basic-photo-backup/` (flat list + Play/Stop button instead of a thumbnail gallery), narrower MIME filter, and drops `bare-media` + `bare-ffmpeg`. `basic-photo-backup/ui/root.jsx:59` already renders the same `<video>` element with the same blob-server link, so a video dropped into photo-backup already plays. The "stream" in the folder name is a misnomer — blobs are uploaded whole, not streamed. See `basic-video-stream/notes.md` for the full comparison. Next study folder TBD by Storyteller. `basic-photo-backup/` wrapped on 2026-05-15 (notes, future-features incl. multi-rooms-style refactor proposal + Pear School use cases + folder-rename suggestion, folder-scoped `--store` paths in README pushed; `pear stage`/`pear seed` end-to-end exercise deferred — bare-channel staging rejected with `A valid pear link must be specified`, likely needs `pear init` or a `name` field in `package.json`'s `pear` block — see `basic-photo-backup/notes.md`). `basic-live-cam/` wrapped on 2026-05-10.
+
+## Folders that are NOT worth studying (redundant)
+
+- **`basic-video-stream/`** — UI reskin of `basic-photo-backup/`. Same autobase + `videos`/`messages` collections, same `hyperblobs` + `hypercore-blob-server` plumbing, same blind-pairing. Differences are cosmetic (list + Play button vs gallery + thumbnails), a narrower MIME check (`worker/video-room.js:182-184`), and the absence of `bare-media`/`bare-ffmpeg`. No new Holepunch primitive. Skip unless Storyteller wants the UI variant for reference. Full comparison in `basic-video-stream/notes.md`.
 
 ## How to take notes
 

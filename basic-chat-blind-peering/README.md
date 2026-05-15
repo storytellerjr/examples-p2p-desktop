@@ -13,7 +13,7 @@ npm run build
 # run a blind peer + print listening-key
 npm i -g blind-peer-cli@latest
 npx blind-peer -s /tmp/blind1
-
+   
 # user1: create room + print invite
 pear run --store /tmp/user1 . --name user1 --blind-peer-key <listening-key>
 
